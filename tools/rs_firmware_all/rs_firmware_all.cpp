@@ -10,6 +10,8 @@
 
 #include <librealsense2/rs.hpp>
 #include <queue>
+#include <atomic>
+#include <map>
 
 const std::filesystem::path BASE_FW_DR = "./fw";
 
@@ -115,79 +117,191 @@ int main (void) {
 	const std::optional<std::filesystem::path> &fw_path = get_latest_firmware_path();
 	if (!fw_path.has_value())
 	{
+		std::cout << "Firmware not found" << std::endl;
 		return EXIT_FAILURE;
 	}
 	std::cout << fw_path->string() << std::endl;
 
-	rs2::context context;
+	const std::vector<uint8_t> fw_image = read_fw_file(*fw_path);
+	if (fw_image.empty())
+	{
+		std::cout << "Firmware file empty" << std::endl;
+		return EXIT_FAILURE;
+	}
+
+	const rs2::context context;
 	const rs2::device_list &device_list = context.query_devices();
 	const size_t device_count = device_list.size();
 	if (device_count <= 0)
 	{
+		std::cout << "Devices not found" << std::endl;
 		return EXIT_FAILURE;
 	}
-	std::cout << "Found " << device_count << " devices" << std::endl;
+
+	std::map<std::string, std::string> serial_update_map;
 	for (uint32_t i = 0; i < device_count; i++)
 	{
 		try
 		{
-			device_list[i].get_info(rs2_camera_info::RS2_CAMERA_INFO_SERIAL_NUMBER);
+			const rs2::device &device = device_list[i];
+			if (device.supports(rs2_camera_info::RS2_CAMERA_INFO_SERIAL_NUMBER) 
+				&& device.supports(rs2_camera_info::RS2_CAMERA_INFO_FIRMWARE_UPDATE_ID))
+			{
+				const std::string serial_number = device.get_info(rs2_camera_info::RS2_CAMERA_INFO_SERIAL_NUMBER);
+				const std::string update_id = device.get_info(rs2_camera_info::RS2_CAMERA_INFO_FIRMWARE_UPDATE_ID);
+				serial_update_map[update_id] = serial_number;
+			}
 		}
-		catch (const rs2::error &e)
+		catch (rs2::error &e)
 		{
-			std::cerr << "Failed Reading Serial number of " << (i + 1) << "th device: " << e.get_failed_function() << "(" << e.get_failed_args() << "):" << e.what() << std::endl;
+			std::cout << "Setting device #" << (i + 1) << " to update state Failed "
+				<< e.get_failed_function() << "(" << e.get_failed_args() << "): "
+				<< e.what() << " (Try Again)" << std::endl;
 			return EXIT_FAILURE;
 		}
-	}
+	};
 
-	const std::vector<uint8_t> fw_image = read_fw_file(*fw_path);
-	if (fw_image.empty())
+	std::cout << "Set all devices to update state" << std::endl;
+	for (uint32_t i = 0; i < device_count; i++)
 	{
-		return EXIT_FAILURE;
-	}
-
-	size_t remaining = 0;
-	std::mutex m;
-	std::condition_variable cv;
-	std::queue<rs2::update_device> update_queue;
-
-	std::vector<std::thread> thread_pool(4, std::thread([&]()
-	{
-		for(;;)
+		try
 		{
-			std::unique_lock<std::mutex> lk(m);
-			cv.wait(lk);
-			if (remaining <= 0)
+			const rs2::device &device = device_list[i];
+			if (!device.is<rs2::update_device>() && device.is<rs2::updatable>())
+			{
+				device.as<rs2::updatable>().enter_update_state();
+			}
+		}
+		catch (rs2::error &e)
+		{
+			std::cout << "Setting device #" << (i + 1) << " to update state Failed "
+				<< e.get_failed_function() << "(" << e.get_failed_args() << "): "
+				<< e.what() << " (Try Again)" << std::endl;
+			return EXIT_FAILURE;
+		}
+	};
+	std::cout << "Set all devices to update state Complete" << std::endl;
+
+	std::cout << "Wait for all devices to enter update state" << std::endl;
+	const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+	for (;;)
+	{
+		try
+		{
+			const rs2::device_list &current_devices = context.query_devices();
+			const uint32_t current_device_count = current_devices.size();
+			uint32_t update_device_count = 0;
+			for (uint32_t i = 0; i < current_device_count; i++)
+			{
+				const rs2::device &device = current_devices[i];
+				if (device.is<rs2::update_device>())
+				{
+					update_device_count++;
+				}
+			}
+			if (update_device_count >= device_count)
 			{
 				break;
 			}
 		}
-	}));
-	
-
-	context.set_devices_changed_callback([&](rs2::event_information &info)
+		catch (...)
 		{
-			const rs2::device_list& new_devices = info.get_new_devices();
-			const uint32_t new_device_count = new_devices.size();
-			if (new_device_count == 0) return;
-			for (size_t i = 0; i < new_device_count; i++)
-			{
-				const rs2::device &device = new_devices[i];
-				if (device.is<rs2::update_device>())
-				{
-					update_queue.push(device.as<rs2::update_device>());
-					cv.notify_all();
-				}
-			}
 		}
-	);
+		if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count() > 15)
+		{
+			break;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(500));
+	}
+	std::cout << "Wait for all devices to enter update state Complete" << std::endl;
 
-	const std::function<void(const rs2::device&)> enter_update = 
-		[](const rs2::device &device)
+	std::cout << "Updating devices !!!DO NOT CLOSE PROGRAM OR SHUTDOWN!!!" << std::endl;
+	for (;;)
 	{
-		device.as<rs2::updatable>().enter_update_state();
-	};
-	t.unlock();
+		const rs2::device_list &current_devices = context.query_devices();
+		const uint32_t current_device_count = current_devices.size();
+		if (current_device_count < device_count)
+		{
+			continue;
+		}
+		std::vector<std::thread> threads;
+		uint32_t count = 0;
+		std::condition_variable cv;
+		std::mutex m, n, o;
+		for (uint32_t i = 0; i < current_device_count; i++)
+		{
+			threads.emplace_back(std::thread([i, &current_devices, &fw_image, &cv, &m, &n, &o, &count, &serial_update_map]()
+			{
+				for (;;)
+				{
+					std::unique_lock<std::mutex> count_lock(n);
+					if (count >= 20)
+					{
+						count_lock.unlock();
+						std::unique_lock<std::mutex> lock(m);
+						cv.wait(lock);
+					} else
+					{
+						count += 1;
+						break;
+					}					
+				}
+
+				try
+				{
+					const rs2::device &device = current_devices[i];
+					const std::string update_id = device.get_info(rs2_camera_info::RS2_CAMERA_INFO_FIRMWARE_UPDATE_ID);
+					const bool has_serial = serial_update_map.find(update_id) != serial_update_map.end();
+					std::ostringstream name_ss;
+					name_ss << (has_serial ? "sn(" : "uid(");
+					name_ss << (has_serial ? serial_update_map[update_id] : update_id);
+					name_ss << ")";
+					const std::string name = name_ss.str();
+					if (device.is<rs2::update_device>())
+					{
+						std::unique_lock<std::mutex> out_lock(o);
+						std::cout << "Updating device " << name << std::endl;
+						out_lock.unlock();
+
+						try
+						{
+							device.as<rs2::update_device>().update(fw_image);
+						}
+						catch (const rs2::error &e)
+						{
+							out_lock.lock();
+							std::cout << "Updating device " << name << " Failed "
+								<< e.get_failed_function() << "(" << e.get_failed_args() << "): "
+								<< e.what() << std::endl;
+							out_lock.unlock();
+							throw;
+						}
+						
+						out_lock.lock();
+						std::cout << "Updating device " << name << " Completed" << std::endl;
+						out_lock.unlock();
+					}
+					else
+					{
+						std::unique_lock<std::mutex> out_lock(o);
+						std::cout << "Skipping device " << name << std::endl;
+						out_lock.unlock();
+					}
+				}
+				catch (...) {}
+				std::unique_lock<std::mutex> count_lock(n);
+				count -= 1;
+				count_lock.unlock();
+				cv.notify_one();
+			}));
+		};
+		for (std::thread &thread: threads)
+		{
+			thread.join();
+		}
+		break;
+	}
+	std::cout << "Updating devices Complete" << std::endl;
 	
     return EXIT_SUCCESS;
 }
