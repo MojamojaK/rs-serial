@@ -32,7 +32,7 @@ int main (void) {
 	std::ofstream output("serials.txt", std::ios::out);
 	for (size_t i = 0; i < actual_size; i++) {
 		std::ostringstream oss;
-		oss << "#" << i << " " << serials[i] << std::endl;
+		oss << "#" << (i + 1) << " " << serials[i] << std::endl;
 		std::cout << oss.str();
 		output << oss.str();
 	}
